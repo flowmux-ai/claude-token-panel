@@ -1,12 +1,74 @@
+import type { On } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 
-import { settle, tally } from '../hooks/tally'
+import { cursor, feed, settle } from '../hooks/tally'
 import type { Row, Usage } from '../types'
 
 const PATH = '/home/me/.claude/projects/-work/s1.jsonl'
 const AGENT = '/home/me/.claude/projects/-work/s1/subagents/agent-a1.jsonl'
-// A transcript the engine's own read takes: under 4 MiB.
-const SMALL = { value: { kind: 'file', size: 1, mtimeMs: 0, isLink: false } } as const
+
+// Counts transcripts' texts whole, the main one first.
+const count = (main: string, agents: string[] = []): Row[] => {
+  const rows: Row[] = []
+  feed(cursor(), rows, main, true)
+
+  for (const agent of agents) {
+    feed(cursor(), rows, agent, false)
+  }
+
+  return rows
+}
+
+// The engine's file ops over `files`, a transcript's text by path as the CLI leaves it, its subagents'
+// folder beside it. `tail -c +N` serves a file from byte N in `cut`-byte pieces (the engine's 4 MiB), or
+// cannot start while `isGone`; the calls made are returned.
+const serve = (
+  on: On,
+  files: () => Record<string, string>,
+  { cut = Infinity, isGone = () => false }: { cut?: number; isGone?: () => boolean } = {},
+): string[][] => {
+  const runs: string[][] = []
+  const bytes = (path: string) => new TextEncoder().encode(files()[path] ?? '')
+  const under = (folder: string) => Object.keys(files()).filter(path => path.startsWith(`${folder}/`))
+
+  on('fs.exists', (_, e) => ({ value: e.path in files() || under(e.path).length > 0 }))
+  on('fs.stat', (_, e) =>
+    e.path in files()
+      ? { value: { kind: 'file', size: bytes(e.path).length, mtimeMs: 0, isLink: false } }
+      : { deny: 'ENOENT' },
+  )
+  on('fs.list', (_, e) => ({
+    value: under(e.path).map(path => ({
+      name: path.slice(e.path.length + 1),
+      kind: 'file',
+      size: bytes(path).length,
+      mtimeMs: 0,
+      isLink: false,
+    })),
+  }))
+  on('process.run', (_, e) => {
+    runs.push([...e.argv])
+
+    if (isGone()) {
+      return { deny: 'tail: cannot start' }
+    }
+
+    const [, , from = '+1', path = ''] = e.argv
+    const piece = bytes(path).slice(Number(from.slice(1)) - 1)
+
+    return {
+      value: {
+        exitCode: 0,
+        stdout: new TextDecoder().decode(piece.slice(0, cut)),
+        stderr: '',
+        isStdoutTruncated: piece.length > cut,
+        isStderrTruncated: false,
+      },
+    }
+  })
+
+  return runs
+}
 
 const prompt = (promptId: string, uuid: string) =>
   JSON.stringify({ type: 'user', promptId, uuid, message: { role: 'user', content: 'hi' } })
@@ -56,14 +118,14 @@ const MAIN = [
   '{"type":"assistant","message":{"id":"m3","mod',
 ].join('\n')
 
-const SUB = [
+const SUB = `${[
   JSON.stringify({ type: 'user', promptId: 'p1', uuid: 'a-u1', isSidechain: true, message: {} }),
   reply('s1', 'claude-haiku-4-5-20251001', { input_tokens: 2000, output_tokens: 1000 }),
   reply('s2', 'some-new-model', { input_tokens: 5, output_tokens: 5 }),
-].join('\n')
+].join('\n')}\n`
 
 test('tally prices each prompt from the transcript and its subagents', () => {
-  const [first, second, ...rest] = tally(MAIN, [SUB])
+  const [first, second, ...rest] = count(MAIN, [SUB])
 
   expect(rest).toEqual([])
   // 1000*10 + 2000*12.5 + 1000*20 + 1M*0.25 + 2000*50 per 1e6, plus the subagent's 2000*1 + 1000*5.
@@ -92,10 +154,27 @@ test('a client-local command leaves no row', () => {
   })
 
   // On its own it lists nothing; after a real turn only the real prompt remains.
-  expect(tally(local)).toEqual([])
+  expect(count(`${local}\n`)).toEqual([])
   expect(
-    tally([prompt('p1', 'u1'), reply('m1', 'claude-opus-5-5', FIRST), local].join('\n')).map(row => row.id),
+    count(`${[prompt('p1', 'u1'), reply('m1', 'claude-opus-5-5', FIRST), local].join('\n')}\n`).map(row => row.id),
   ).toEqual(['p1'])
+})
+
+test('a cursor feeds whole lines, waits for one without its newline, and counts a response by its latest copy', () => {
+  const rows: Row[] = []
+  const place = cursor()
+  const hello = `${JSON.stringify({ type: 'user', promptId: 'p1', uuid: 'u1', message: { role: 'user', content: '안녕' } })}\n`
+  const answer = `${reply('m1', 'claude-opus-5-5', { input_tokens: 10 })}\n`
+  // A subagent's first copy lacks the output its last copy has.
+  const full = `${reply('m1', 'claude-opus-5-5', { input_tokens: 10, output_tokens: 5 })}\n`
+
+  // The prompt's line is fed, counted in bytes; the response's, cut short, waits.
+  expect(feed(place, rows, `${hello}${answer.slice(0, 20)}`, true)).toBe(hello.length + 4)
+  expect(rows.map(row => row.input)).toEqual([0])
+  // Whole, it counts; a copy with more counts in its place; fed again (a count overlapping another), nothing changes.
+  expect(feed(place, rows, `${answer}${full}`, true)).toBe(answer.length + full.length)
+  expect(feed(place, rows, full, true)).toBe(full.length)
+  expect(rows.map(row => [row.input, row.output, row.usd])).toEqual([[10, 5, 0.00014]])
 })
 
 test('settle sets what the engine billed beyond the transcripts against the prompt it fell in', () => {
@@ -141,12 +220,7 @@ test('the pane lists every prompt; pressing a row reveals its prompt and beats i
     value: { startedAt: 0, context: { window: 1_000_000 }, rateLimits: [], cost: { usd: billed } },
   }))
 
-  on('fs.exists', (_, e) => ({ value: e.path === PATH || e.path === PATH.replace('.jsonl', '/subagents') }))
-  on('fs.stat', () => SMALL)
-  on('fs.list', () => ({
-    value: [{ name: 'agent-a1.jsonl', kind: 'file', size: 1, mtimeMs: 0, isLink: false }],
-  }))
-  on('fs.read', (_, e) => ({ value: e.path === PATH ? MAIN : e.path === AGENT ? SUB : '' }))
+  serve(on, () => ({ [PATH]: MAIN, [AGENT]: SUB }))
   on('classic.PostToolUse', () => ({}))
   // The kit has no transcript to scroll: the mod says so and beats all the same.
   on('ui.toast', (_, e) => (toasts.push(e.text), { value: undefined }))
@@ -156,7 +230,11 @@ test('the pane lists every prompt; pressing a row reveals its prompt and beats i
     return h(Text, null, 'engine') as never
   })
 
-  await $.classic.PostToolUse({ transcript_path: PATH } as never)
+  // Two counts at once (a tool's end, the engine's bill) feed the same lines: counted once.
+  await Promise.all([
+    $.classic.PostToolUse({ transcript_path: PATH } as never),
+    $.classic.PostToolUse({ transcript_path: PATH } as never),
+  ])
 
   // Above the prompt the columns spread over the width: 12 spare cells, 2 per gap.
   const wide = await $.ui.mount({
@@ -217,12 +295,10 @@ test('the pane lists every prompt; pressing a row reveals its prompt and beats i
 })
 
 test('above the prompt the list shows the five newest prompts and scrolls under the head and the sum', async ($, on) => {
-  const many = ['1', '2', '3', '4', '5', '6', '7'].map(n => prompt(`p${n}`, `u${n}`)).join('\n')
+  const many = `${['1', '2', '3', '4', '5', '6', '7'].map(n => prompt(`p${n}`, `u${n}`)).join('\n')}\n`
 
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1_000_000 }, rateLimits: [] } }))
-  on('fs.exists', (_, e) => ({ value: e.path === PATH }))
-  on('fs.stat', () => SMALL)
-  on('fs.read', () => ({ value: many }))
+  serve(on, () => ({ [PATH]: many }))
   on('classic.PostToolUse', () => ({}))
   await $.classic.PostToolUse({ transcript_path: PATH } as never)
 
@@ -274,9 +350,7 @@ test('a prompt submitted before its transcript is written is listed when the tur
   let isWritten = false
 
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1_000_000 }, rateLimits: [] } }))
-  on('fs.exists', (_, e) => ({ value: e.path === PATH && isWritten }))
-  on('fs.stat', () => SMALL)
-  on('fs.read', () => ({ value: prompt('p1', 'u1') }))
+  serve(on, () => (isWritten ? { [PATH]: `${prompt('p1', 'u1')}\n` } : {}))
   on('classic.UserPromptSubmit', () => ({}))
   on('turn.complete', () => ({ text: '' }))
 
@@ -297,31 +371,12 @@ test('a prompt submitted before its transcript is written is listed when the tur
   expect(await pane.find({ key: 'row:u1' })).toBeDefined()
 })
 
-test('a transcript past the 4 MiB read limit is read in pieces through tail; a failed count says why', async ($, on) => {
-  const bytes = new TextEncoder().encode(MAIN)
+test('a transcript is read through tail in pieces, each count from where the last ended; a failed count says why', async ($, on) => {
+  let isGone = false
   // The engine cuts a run's output at 4 MiB; here at 150 bytes, inside a line.
-  const CUT = 150
-  let size = 5_000_000
-  const runs: string[][] = []
+  const runs = serve(on, () => ({ [PATH]: MAIN }), { cut: 150, isGone: () => isGone })
 
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1_000_000 }, rateLimits: [] } }))
-  on('fs.exists', (_, e) => ({ value: e.path === PATH }))
-  on('fs.stat', () => ({ value: { kind: 'file', size, mtimeMs: 0, isLink: false } }))
-  on('fs.read', () => ({ deny: 'over 4 MiB' }))
-  on('process.run', (_, e) => {
-    runs.push([...e.argv])
-    const piece = bytes.slice(Number(e.argv[2]?.slice(1)) - 1)
-
-    return {
-      value: {
-        exitCode: 0,
-        stdout: new TextDecoder().decode(piece.slice(0, CUT)),
-        stderr: '',
-        isStdoutTruncated: piece.length > CUT,
-        isStderrTruncated: false,
-      },
-    }
-  })
   on('classic.PostToolUse', () => ({}))
   await $.classic.PostToolUse({ transcript_path: PATH } as never)
 
@@ -339,14 +394,18 @@ test('a transcript past the 4 MiB read limit is read in pieces through tail; a f
   expect((await pane.find({ key: `row:${U2}` }))?.props.label).toBe('  2 haiku-4-5   1.1k   1.1k      0      0   $0.02')
   expect(await pane.find({ type: 'Text', text: /^Token panel: / })).toBeUndefined()
 
-  // A small file's read the engine refuses: the table stays and the pane says why.
-  size = 10
+  // The next count reads from the first byte of the line still being written, and nothing before it.
+  const whole = new TextEncoder().encode(MAIN.slice(0, MAIN.lastIndexOf('\n') + 1)).length
+  const before = runs.length
+  await $.classic.PostToolUse({ transcript_path: PATH } as never)
+  expect(runs.slice(before)).toEqual([['tail', '-c', `+${whole + 1}`, PATH]])
+
+  // No tail on the host: the table stays and the pane says why; the next count that succeeds clears it.
+  isGone = true
   await $.classic.PostToolUse({ transcript_path: PATH } as never)
   expect(await pane.find({ key: `row:${U2}` })).toBeDefined()
-  expect(await pane.find({ type: 'Text', text: /^Token panel: .*over 4 MiB/ })).toBeDefined()
-
-  // The next count that succeeds clears it.
-  size = 5_000_000
+  expect(await pane.find({ type: 'Text', text: /^Token panel: .*tail/ })).toBeDefined()
+  isGone = false
   await $.classic.PostToolUse({ transcript_path: PATH } as never)
   expect(await pane.find({ type: 'Text', text: /^Token panel: / })).toBeUndefined()
 })
@@ -403,9 +462,7 @@ test('with no classic event, a turn finds the transcript where the CLI keeps it 
   on('session.root', () => ({ value: '/work' }))
   on('session.id', () => ({ value: 's1' }))
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1_000_000 }, rateLimits: [] } }))
-  on('fs.exists', (_, e) => ({ value: isWritten && e.path === PATH }))
-  on('fs.stat', () => SMALL)
-  on('fs.read', () => ({ value: MAIN }))
+  serve(on, () => (isWritten ? { [PATH]: MAIN } : {}))
   on('command.register', () => ({ value: undefined }))
   on('session.start', (_, e) => e as never)
   on('turn.complete', () => ({ text: '' }) as never)

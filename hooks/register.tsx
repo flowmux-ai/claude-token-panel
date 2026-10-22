@@ -2,7 +2,8 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import type { Flash, Row, Usage } from '../types'
-import { settle, tally } from './tally'
+import type { Cursor } from './tally'
+import { cursor, feed, settle } from './tally'
 
 const PANE = 'token-panel'
 const TITLE = 'Claude Token Panel'
@@ -50,43 +51,54 @@ const locate = async ($: EngineInterface): Promise<string | null> => {
   return (await $.fs.exists(path)) ? path : null
 }
 
-// The engine's read rejects a file over 4 MiB: past that, `tail` serves it in pieces of as much.
-const LIMIT = 4194304
+// The session's count so far: the transcript's path, its rows, and how far each file is read. A reload
+// starts over, as the module does; so does a new path (/clear).
+// ponytail: a count from zero reads the whole transcript again, 18 MB in five `tail` runs and ~50 ms of parsing
+type Count = { path: string; rows: Row[]; cursors: Map<string, Cursor> }
+let count: Count | undefined
 
-// A transcript's whole text, of `size` bytes.
-const load = async ($: EngineInterface, path: string, size: number): Promise<string> => {
-  if (size <= LIMIT) {
-    return $.fs.read(path)
+// Feeds `of.rows` what `path` holds past its cursor, in pieces of what a run's output carries (4 MiB): the
+// engine's own read rejects a file over that, `tail` reads from any offset. Two counts at once feed the
+// same lines, which count once, and set the cursor to the same place.
+const pull = async ($: EngineInterface, of: Count, path: string, size: number, isMain: boolean): Promise<void> => {
+  const place = of.cursors.get(path) ?? cursor()
+  of.cursors.set(path, place)
+
+  // Nothing written since the last count: a transcript only grows.
+  if (size <= place.at) {
+    return
   }
 
-  let text = ''
+  const start = place.at
+  // The bytes of whole lines fed by this count, and the text read past them: a line cut by a piece's
+  // end is whole with the next piece.
+  let done = 0
+  let rest = ''
 
-  for (let at = 0; ; ) {
-    const { exitCode, stdout, stderr, isStdoutTruncated } = await $.process.run(['tail', '-c', `+${at + 1}`, path])
+  for (let from = start; ; ) {
+    const { exitCode, stdout, stderr, isStdoutTruncated } = await $.process.run(['tail', '-c', `+${from + 1}`, path])
 
     // A file gone or unreadable mid-way: no partial count.
     if (exitCode !== 0) {
       throw new Error(stderr.trim())
     }
 
-    if (!isStdoutTruncated) {
-      return text + stdout
-    }
+    const text = rest + stdout
+    done += feed(place, of.rows, text, isMain)
+    place.at = start + done
+    rest = text.slice(text.lastIndexOf('\n') + 1)
+    // A cut inside a multi-byte character drops it: the text's own bytes are what was read whole.
+    from += new TextEncoder().encode(stdout).length
 
-    // The cut falls inside a line and may drop a multi-byte character: keep whole lines and count their
-    // bytes; a line that alone passes the limit is taken as it comes.
-    const cut = stdout.lastIndexOf('\n') + 1
-    const kept = cut > 0 ? stdout.slice(0, cut) : stdout
-    text += kept
-    at += new TextEncoder().encode(kept).length
+    if (!isStdoutTruncated || stdout === '') {
+      return
+    }
   }
 }
 
-// Counts the session again from its transcript, and its subagents' beside it,
+// Counts what the session's transcript, and its subagents' beside it, hold since the last count,
 // then sets what the engine billed beyond them against the prompt it fell in.
 // A count that fails leaves the table as it was and says why in the pane.
-// ponytail: every file is read whole each time (18 MB parses in 50 ms; past 4 MiB each `tail` streams the rest and the
-// engine drops what is past its cut, 50 MB of I/O for 18 MB); keep offsets if a tool call waits on it
 const refresh = async ($: EngineInterface, seen?: string, isNewPrompt = false): Promise<void> => {
   const path = seen ?? (await read($, usage)).path ?? (await locate($))
 
@@ -95,17 +107,26 @@ const refresh = async ($: EngineInterface, seen?: string, isNewPrompt = false): 
   }
 
   try {
+    const of = count?.path === path ? count : { path, rows: [], cursors: new Map<string, Cursor>() }
+    count = of
+
+    // Before the first prompt the transcript is not written yet: count it empty, but keep its path for the next
+    // count. The main transcript goes first: a subagent's prompt entries find their rows in it.
+    if (await $.fs.exists(path)) {
+      await pull($, of, path, (await $.fs.stat(path)).size, true)
+    }
+
     const folder = path.replace(/\.jsonl$/, '/subagents')
     const entries = (await $.fs.exists(folder)) ? await $.fs.list(folder) : []
-    const agents = await Promise.all(
+    await Promise.all(
       entries
         .filter(entry => entry.name.endsWith('.jsonl'))
-        .map(entry => load($, `${folder}/${entry.name}`, entry.size)),
+        .map(entry => pull($, of, `${folder}/${entry.name}`, entry.size, false)),
     )
-    // Before the first prompt the transcript is not written yet: count it empty, but keep its path for the next count.
-    const main = (await $.fs.exists(path)) ? await load($, path, (await $.fs.stat(path)).size) : ''
-    const rows = tally(main, agents)
+
     const { cost } = await $.session.usage()
+    // `settle` sets `other` on its rows: copies, so the count's rows stay the transcripts' own.
+    const rows = of.rows.map(row => ({ ...row }))
 
     await update($, usage, old => settle(old, path, rows, cost?.usd, isNewPrompt))
     await update($, fault, () => null)

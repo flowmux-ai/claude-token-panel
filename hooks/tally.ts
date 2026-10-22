@@ -32,7 +32,8 @@ type Use = {
   iterations?: Use[] | null
 }
 
-const spend = (row: Row, model: string, use: Use): void => {
+// Adds `use` to the row, or with `sign` -1 takes it back.
+const spend = (row: Row, model: string, use: Use, sign: 1 | -1): void => {
   const input = use.input_tokens ?? 0
   const output = use.output_tokens ?? 0
   const read = use.cache_read_input_tokens ?? 0
@@ -40,10 +41,10 @@ const spend = (row: Row, model: string, use: Use): void => {
   const hour = use.cache_creation?.ephemeral_1h_input_tokens ?? 0
   const rate = RATES.find(([part]) => model.includes(part))
 
-  row.input += input
-  row.output += output
-  row.cacheRead += read
-  row.cacheWrite += write
+  row.input += sign * input
+  row.output += sign * output
+  row.cacheRead += sign * read
+  row.cacheWrite += sign * write
 
   if (rate === undefined) {
     row.isUnpriced ||= input + output + read + write > 0
@@ -53,91 +54,118 @@ const spend = (row: Row, model: string, use: Use): void => {
 
   const [, perInput, perOutput, perRead] = rate
   row.usd +=
-    (input * perInput +
-      (write - hour) * perInput * 1.25 +
-      hour * perInput * 2 +
-      read * perRead +
-      output * perOutput) /
+    (sign *
+      (input * perInput +
+        (write - hour) * perInput * 1.25 +
+        hour * perInput * 2 +
+        read * perRead +
+        output * perOutput)) /
     1e6
 }
 
+// A response's usage as the transcript stores it, counted toward a row at a model.
+type Charge = { row: Row; model: string; usage: Use }
+
+const charge = ({ row, model, usage }: Charge, sign: 1 | -1): void => {
+  for (const use of usage.iterations?.length ? usage.iterations : [usage]) {
+    spend(row, use.model ?? model, use, sign)
+  }
+}
+
 /**
- * The session's prompts with what each one used, from its transcript's text
- * and its subagents' transcripts: a subagent counts toward the prompt that
- * spawned it.
+ * How far one transcript is counted: the bytes fed so far, the prompt the
+ * next response falls in, and what each response counted. A response is
+ * stored once per content block, and a subagent's first copy lacks its
+ * output: a later copy counts in place of the earlier.
  */
-export const tally = (main: string, agents: readonly string[] = []): Row[] => {
-  const rows: Row[] = []
+export type Cursor = { at: number; row: Row | undefined; counted: Map<string, Charge> }
 
-  for (const text of [main, ...agents]) {
-    // A response is stored once per content block, each copy with the whole usage.
-    const responses = new Map<string, { row: Row; model: string; usage: Use }>()
-    let row: Row | undefined
+export const cursor = (): Cursor => ({ at: 0, row: undefined, counted: new Map() })
 
-    for (const line of text.split('\n')) {
-      let entry
+/**
+ * Feeds `text`'s whole lines to `rows`, from the main transcript (`isMain`: a
+ * prompt starts a row) or a subagent's (a prompt finds the row that spawned
+ * it). Returns the bytes fed: a last line without its newline, still being
+ * written or cut by a read, waits. Fed twice, lines count once.
+ */
+export const feed = (cursor: Cursor, rows: Row[], text: string, isMain: boolean): number => {
+  const whole = text.slice(0, text.lastIndexOf('\n') + 1)
 
-      try {
-        entry = JSON.parse(line)
-      } catch {
-        // A blank line, or one still being written.
-        continue
-      }
+  for (const line of whole.split('\n')) {
+    let entry
 
-      // A client-local command (/reload-plugins, /clear, …) echoes itself in a user entry but
-      // runs no model turn; it is not a prompt. A model-invoking command keeps its expanded
-      // prompt in a separate entry, so skipping the echo still leaves its row.
-      const content: unknown = entry?.message?.content
-      const isCommand = typeof content === 'string' && /^\s*<(command-|local-command-)/.test(content)
-
-      // A meta entry (a slash command's caveat) is never drawn: the prompt's row takes the next one's uuid.
-      if (
-        entry?.type === 'user' &&
-        entry.isMeta !== true &&
-        !isCommand &&
-        typeof entry.promptId === 'string' &&
-        entry.promptId !== row?.id
-      ) {
-        row = rows.find(known => known.id === entry.promptId)
-
-        if (row === undefined && text === main) {
-          row = {
-            id: entry.promptId,
-            uuid: String(entry.uuid),
-            model: '',
-            input: 0,
-            output: 0,
-            cacheRead: 0,
-            cacheWrite: 0,
-            usd: 0,
-            other: 0,
-            isUnpriced: false,
-          }
-          rows.push(row)
-        }
-      }
-
-      const message = entry?.type === 'assistant' ? entry.message : undefined
-      const owner = responses.get(message?.id)?.row ?? row ?? rows.at(-1)
-
-      if (message?.usage && owner !== undefined) {
-        responses.set(message.id, { row: owner, model: String(message.model), usage: message.usage })
-      }
+    try {
+      entry = JSON.parse(line)
+    } catch {
+      // A blank line, or one cut short.
+      continue
     }
 
-    for (const { row: owner, model, usage } of responses.values()) {
-      // The prompt's model is its own loop's last, never a subagent's or a made-up row's.
-      if (text === main && !model.startsWith('<')) {
-        owner.model = model.replace(/^.*claude-/, '').replace(/-\d{8}$/, '').slice(0, 9)
+    // A client-local command (/reload-plugins, /clear, …) echoes itself in a user entry but
+    // runs no model turn; it is not a prompt. A model-invoking command keeps its expanded
+    // prompt in a separate entry, so skipping the echo still leaves its row.
+    const content: unknown = entry?.message?.content
+    const isCommand = typeof content === 'string' && /^\s*<(command-|local-command-)/.test(content)
+
+    // A meta entry (a slash command's caveat) is never drawn: the prompt's row takes the next one's uuid.
+    if (
+      entry?.type === 'user' &&
+      entry.isMeta !== true &&
+      !isCommand &&
+      typeof entry.promptId === 'string' &&
+      entry.promptId !== cursor.row?.id
+    ) {
+      let row = rows.find(known => known.id === entry.promptId)
+
+      if (row === undefined && isMain) {
+        row = {
+          id: entry.promptId,
+          uuid: String(entry.uuid),
+          model: '',
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          usd: 0,
+          other: 0,
+          isUnpriced: false,
+        }
+        rows.push(row)
       }
 
-      for (const use of usage.iterations?.length ? usage.iterations : [usage]) {
-        spend(owner, use.model ?? model, use)
-      }
+      cursor.row = row
+    }
+
+    const message = entry?.type === 'assistant' ? entry.message : undefined
+
+    if (!message?.usage) {
+      continue
+    }
+
+    // A copy of a response counts toward the row its first copy did; a copy the same as the one counted (fed again) changes nothing.
+    const was = cursor.counted.get(message.id)
+    const owner = was?.row ?? cursor.row ?? rows.at(-1)
+
+    if (owner === undefined || JSON.stringify(was?.usage) === JSON.stringify(message.usage)) {
+      continue
+    }
+
+    const now: Charge = { row: owner, model: String(message.model), usage: message.usage }
+
+    if (was !== undefined) {
+      charge(was, -1)
+    }
+
+    charge(now, 1)
+    cursor.counted.set(message.id, now)
+
+    // The prompt's model is its own loop's last, never a subagent's or a made-up row's.
+    if (isMain && !now.model.startsWith('<')) {
+      owner.model = now.model.replace(/^.*claude-/, '').replace(/-\d{8}$/, '').slice(0, 9)
     }
   }
 
-  return rows
+  return new TextEncoder().encode(whole).length
 }
 
 /**

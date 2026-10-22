@@ -5,6 +5,8 @@ import type { Row, Usage } from '../types'
 
 const PATH = '/home/me/.claude/projects/-work/s1.jsonl'
 const AGENT = '/home/me/.claude/projects/-work/s1/subagents/agent-a1.jsonl'
+// A transcript the engine's own read takes: under 4 MiB.
+const SMALL = { value: { kind: 'file', size: 1, mtimeMs: 0, isLink: false } } as const
 
 const prompt = (promptId: string, uuid: string) =>
   JSON.stringify({ type: 'user', promptId, uuid, message: { role: 'user', content: 'hi' } })
@@ -140,6 +142,7 @@ test('the pane lists every prompt; pressing a row reveals its prompt and beats i
   }))
 
   on('fs.exists', (_, e) => ({ value: e.path === PATH || e.path === PATH.replace('.jsonl', '/subagents') }))
+  on('fs.stat', () => SMALL)
   on('fs.list', () => ({
     value: [{ name: 'agent-a1.jsonl', kind: 'file', size: 1, mtimeMs: 0, isLink: false }],
   }))
@@ -218,6 +221,7 @@ test('above the prompt the list shows the five newest prompts and scrolls under 
 
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1_000_000 }, rateLimits: [] } }))
   on('fs.exists', (_, e) => ({ value: e.path === PATH }))
+  on('fs.stat', () => SMALL)
   on('fs.read', () => ({ value: many }))
   on('classic.PostToolUse', () => ({}))
   await $.classic.PostToolUse({ transcript_path: PATH } as never)
@@ -271,6 +275,7 @@ test('a prompt submitted before its transcript is written is listed when the tur
 
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1_000_000 }, rateLimits: [] } }))
   on('fs.exists', (_, e) => ({ value: e.path === PATH && isWritten }))
+  on('fs.stat', () => SMALL)
   on('fs.read', () => ({ value: prompt('p1', 'u1') }))
   on('classic.UserPromptSubmit', () => ({}))
   on('turn.complete', () => ({ text: '' }))
@@ -290,6 +295,60 @@ test('a prompt submitted before its transcript is written is listed when the tur
   isWritten = true
   await $.turn.complete({ reason: 'answer', answer: '', durationMs: 0, isAborted: false, turnId: 't1' } as never)
   expect(await pane.find({ key: 'row:u1' })).toBeDefined()
+})
+
+test('a transcript past the 4 MiB read limit is read in pieces through tail; a failed count says why', async ($, on) => {
+  const bytes = new TextEncoder().encode(MAIN)
+  // The engine cuts a run's output at 4 MiB; here at 150 bytes, inside a line.
+  const CUT = 150
+  let size = 5_000_000
+  const runs: string[][] = []
+
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1_000_000 }, rateLimits: [] } }))
+  on('fs.exists', (_, e) => ({ value: e.path === PATH }))
+  on('fs.stat', () => ({ value: { kind: 'file', size, mtimeMs: 0, isLink: false } }))
+  on('fs.read', () => ({ deny: 'over 4 MiB' }))
+  on('process.run', (_, e) => {
+    runs.push([...e.argv])
+    const piece = bytes.slice(Number(e.argv[2]?.slice(1)) - 1)
+
+    return {
+      value: {
+        exitCode: 0,
+        stdout: new TextDecoder().decode(piece.slice(0, CUT)),
+        stderr: '',
+        isStdoutTruncated: piece.length > CUT,
+        isStderrTruncated: false,
+      },
+    }
+  })
+  on('classic.PostToolUse', () => ({}))
+  await $.classic.PostToolUse({ transcript_path: PATH } as never)
+
+  const pane = await $.ui.mount({
+    plugin: 'token-panel',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'token-panel',
+    props: { title: 'Token panel', isFocused: false, bodyColumns: 40, placement: 'dock' } as never,
+  })
+
+  expect(runs[0]).toEqual(['tail', '-c', '+1', PATH])
+  expect(runs.length).toBeGreaterThan(2)
+  expect((await pane.find({ key: 'row:u1' }))?.props.label).toBe('  1 fable-5-1   1.0k   2.0k  1.00M   3.0k   $0.41')
+  expect((await pane.find({ key: `row:${U2}` }))?.props.label).toBe('  2 haiku-4-5   1.1k   1.1k      0      0   $0.02')
+  expect(await pane.find({ type: 'Text', text: /^Token panel: / })).toBeUndefined()
+
+  // A small file's read the engine refuses: the table stays and the pane says why.
+  size = 10
+  await $.classic.PostToolUse({ transcript_path: PATH } as never)
+  expect(await pane.find({ key: `row:${U2}` })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: /^Token panel: .*over 4 MiB/ })).toBeDefined()
+
+  // The next count that succeeds clears it.
+  size = 5_000_000
+  await $.classic.PostToolUse({ transcript_path: PATH } as never)
+  expect(await pane.find({ type: 'Text', text: /^Token panel: / })).toBeUndefined()
 })
 
 test('/token-panel closes an open pane and opens a closed one', async ($, on) => {
@@ -345,6 +404,7 @@ test('with no classic event, a turn finds the transcript where the CLI keeps it 
   on('session.id', () => ({ value: 's1' }))
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1_000_000 }, rateLimits: [] } }))
   on('fs.exists', (_, e) => ({ value: isWritten && e.path === PATH }))
+  on('fs.stat', () => SMALL)
   on('fs.read', () => ({ value: MAIN }))
   on('command.register', () => ({ value: undefined }))
   on('session.start', (_, e) => e as never)

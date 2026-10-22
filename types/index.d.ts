@@ -36,6 +36,7 @@ export type Flash = { uuid: string; isOn: boolean } | null
 
 declare module 'claude-code' {
   interface PluginState {
-    'token-panel': { usage: Usage; flash: Flash; back: number; isShown: boolean }
+    // `fault` says why the last count failed, while it does: the rows are the last good count's.
+    'token-panel': { usage: Usage; flash: Flash; back: number; isShown: boolean; fault: string | null }
   }
 }

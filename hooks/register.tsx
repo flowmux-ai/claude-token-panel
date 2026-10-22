@@ -17,6 +17,7 @@ const NONE: Usage = { path: null, rows: [], offset: null, mark: 0, marks: {}, re
 const DARK: Flash = null
 const usage = atom({ plugin: 'token-panel', key: 'usage' } as const, NONE)
 const flash = atom({ plugin: 'token-panel', key: 'flash' } as const, DARK)
+const fault = atom({ plugin: 'token-panel', key: 'fault' } as const, null as string | null)
 // How many prompts the list is scrolled up from the newest: 0 keeps the newest in view.
 const back = atom({ plugin: 'token-panel', key: 'back' } as const, 0)
 // Whether the pane is drawn: while it is not, the band above the prompt holds its button.
@@ -49,9 +50,43 @@ const locate = async ($: EngineInterface): Promise<string | null> => {
   return (await $.fs.exists(path)) ? path : null
 }
 
+// The engine's read rejects a file over 4 MiB: past that, `tail` serves it in pieces of as much.
+const LIMIT = 4194304
+
+// A transcript's whole text, of `size` bytes.
+const load = async ($: EngineInterface, path: string, size: number): Promise<string> => {
+  if (size <= LIMIT) {
+    return $.fs.read(path)
+  }
+
+  let text = ''
+
+  for (let at = 0; ; ) {
+    const { exitCode, stdout, stderr, isStdoutTruncated } = await $.process.run(['tail', '-c', `+${at + 1}`, path])
+
+    // A file gone or unreadable mid-way: no partial count.
+    if (exitCode !== 0) {
+      throw new Error(stderr.trim())
+    }
+
+    if (!isStdoutTruncated) {
+      return text + stdout
+    }
+
+    // The cut falls inside a line and may drop a multi-byte character: keep whole lines and count their
+    // bytes; a line that alone passes the limit is taken as it comes.
+    const cut = stdout.lastIndexOf('\n') + 1
+    const kept = cut > 0 ? stdout.slice(0, cut) : stdout
+    text += kept
+    at += new TextEncoder().encode(kept).length
+  }
+}
+
 // Counts the session again from its transcript, and its subagents' beside it,
 // then sets what the engine billed beyond them against the prompt it fell in.
-// ponytail: every file is read whole each time, tail them if a session's transcripts grow past tens of MB
+// A count that fails leaves the table as it was and says why in the pane.
+// ponytail: every file is read whole each time (18 MB parses in 50 ms; past 4 MiB each `tail` streams the rest and the
+// engine drops what is past its cut, 50 MB of I/O for 18 MB); keep offsets if a tool call waits on it
 const refresh = async ($: EngineInterface, seen?: string, isNewPrompt = false): Promise<void> => {
   const path = seen ?? (await read($, usage)).path ?? (await locate($))
 
@@ -59,18 +94,24 @@ const refresh = async ($: EngineInterface, seen?: string, isNewPrompt = false): 
     return
   }
 
-  const folder = path.replace(/\.jsonl$/, '/subagents')
-  const entries = (await $.fs.exists(folder)) ? await $.fs.list(folder) : []
-  const agents = await Promise.all(
-    entries
-      .filter(entry => entry.name.endsWith('.jsonl'))
-      .map(entry => $.fs.read(`${folder}/${entry.name}`)),
-  )
-  // Before the first prompt the transcript is not written yet: count it empty, but keep its path for the next count.
-  const rows = tally((await $.fs.exists(path)) ? await $.fs.read(path) : '', agents)
-  const { cost } = await $.session.usage()
+  try {
+    const folder = path.replace(/\.jsonl$/, '/subagents')
+    const entries = (await $.fs.exists(folder)) ? await $.fs.list(folder) : []
+    const agents = await Promise.all(
+      entries
+        .filter(entry => entry.name.endsWith('.jsonl'))
+        .map(entry => load($, `${folder}/${entry.name}`, entry.size)),
+    )
+    // Before the first prompt the transcript is not written yet: count it empty, but keep its path for the next count.
+    const main = (await $.fs.exists(path)) ? await load($, path, (await $.fs.stat(path)).size) : ''
+    const rows = tally(main, agents)
+    const { cost } = await $.session.usage()
 
-  await update($, usage, old => settle(old, path, rows, cost?.usd, isNewPrompt))
+    await update($, usage, old => settle(old, path, rows, cost?.usd, isNewPrompt))
+    await update($, fault, () => null)
+  } catch (error) {
+    await update($, fault, () => `Token panel: ${String(error)}`)
+  }
 }
 
 // Opens the pane; one that waits undrawn leaves the button up.
@@ -118,8 +159,9 @@ export const register: Register = on => {
       name: PANE,
       description: 'Show or hide the per-prompt token usage and cost pane',
     })
-    // A reload drops the timer: no beat is left running.
+    // A reload drops the timer: no beat is left running. A past session's fault is not this one's.
     await update($, flash, () => null)
+    await update($, fault, () => null)
 
     // Every session starts with the pane shut: the button above the prompt or /token-panel opens it.
     await refresh($)
@@ -189,10 +231,14 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Button, Text } = $.ui.resolve(e)
     const { rows, rest = 0 } = await read($, usage)
+    const why = await read($, fault)
     // Docked, the table keeps two empty rows above and below it.
     const inset = e.props.placement === 'dock' ? 2 : 0
-    const room =
-      e.props.placement === 'inline' ? LIST : Math.max(1, (e.viewport?.rows ?? 24) - 8 - 2 * inset)
+    // A failed count's line takes one of the list's.
+    const room = Math.max(
+      1,
+      (e.props.placement === 'inline' ? LIST : (e.viewport?.rows ?? 24) - 8 - 2 * inset) - (why === null ? 0 : 1),
+    )
     const end = rows.length - Math.min(await read($, back), Math.max(0, rows.length - room))
     const start = Math.max(0, end - room)
     shown = room
@@ -230,6 +276,11 @@ export const register: Register = on => {
             rows.some(row => row.isUnpriced),
           ).join(gap)}
         </Text>
+        {why !== null && (
+          <Text color="red" wrap="truncate-start">
+            {why}
+          </Text>
+        )}
       </Box>
     )
   })

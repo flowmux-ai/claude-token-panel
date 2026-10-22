@@ -4,7 +4,8 @@ import type { Row, Usage } from '../types'
 // usage at: [model id part, input, output, cache read]. The first match wins.
 // A cache write costs 1.25x input (5 minutes) or 2x input (1 hour).
 // ponytail: a table that rots, refresh it from platform.claude.com/docs/en/about-claude/pricing.
-// Not priced: fast mode, US-only inference (1.1x), web search requests.
+// Not priced: fast mode, US-only inference (1.1x), web search requests, Haiku 5.5's
+// higher rate past a 100K-token prompt.
 const RATES: readonly (readonly [string, number, number, number])[] = [
   ['claude-fable-5-1', 10, 50, 0.25],
   ['claude-mythos-5-1', 10, 50, 0.25],
@@ -17,6 +18,7 @@ const RATES: readonly (readonly [string, number, number, number])[] = [
   ['claude-opus', 5, 25, 0.5],
   ['claude-sonnet-5', 2, 10, 0.2],
   ['claude-sonnet', 3, 15, 0.3],
+  ['claude-haiku-5-5', 0.1, 0.5, 0.01],
   ['claude-haiku-4-5', 1, 5, 0.1],
 ]
 

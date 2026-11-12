@@ -53,6 +53,22 @@ const serve = (
       return { deny: 'tail: cannot start' }
     }
 
+    // `sh -c 'tail -c +N "$2" | head -c 1' sh N path`: the byte before where a saved count stopped.
+    if (e.argv[0] === 'sh') {
+      const [, , , , at = '0', file = ''] = e.argv
+      const byte = bytes(file).slice(Number(at) - 1, Number(at))
+
+      return {
+        value: {
+          exitCode: 0,
+          stdout: new TextDecoder().decode(byte),
+          stderr: '',
+          isStdoutTruncated: false,
+          isStderrTruncated: false,
+        },
+      }
+    }
+
     const [, , from = '+1', path = ''] = e.argv
     const piece = bytes(path).slice(Number(from.slice(1)) - 1)
 
@@ -482,4 +498,98 @@ test('with no classic event, a turn finds the transcript where the CLI keeps it 
   isWritten = true
   await $.turn.complete({ answer: '' } as never)
   expect(await pane.find({ key: 'row:u1' })).toBeDefined()
+})
+
+// The plugin's store, held in `held` for the test to read.
+const store = (on: On, held: Map<string, unknown>): void => {
+  on('store.get', (_, e) => ({ value: held.get(e.key) }))
+  on('store.set', (_, e) => (held.set(e.key, JSON.parse(JSON.stringify(e.value))), { value: undefined }))
+  on('store.delete', (_, e) => (held.delete(e.key), { value: undefined }))
+  on('store.keys', () => ({ value: [...held.keys()] }))
+}
+
+const OTHER = '/home/me/.claude/projects/-work/s2.jsonl'
+// MAIN's whole lines: the line still being written left out.
+const WHOLE = `${MAIN.slice(0, MAIN.lastIndexOf('\n'))}\n`
+
+test("a turn's end saves the count; a count that takes it up again reads only what came after it", async ($, on) => {
+  const held = new Map<string, unknown>([
+    ['note', 'kept'],
+    ...[1, 2, 3, 4, 5, 6, 7, 8].map(n => [`count:/old${n}`, {}] as const),
+  ])
+  const later = `${prompt('p3', 'u3')}\n${reply('m9', 'claude-opus-5-5', { input_tokens: 7 })}\n`
+  let files: Record<string, string> = { [PATH]: WHOLE, [AGENT]: SUB, [OTHER]: `${prompt('q1', 'v1')}\n` }
+  const runs = serve(on, () => files)
+
+  store(on, held)
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1_000_000 }, rateLimits: [] } }))
+  on('classic.PostToolUse', () => ({}))
+  on('turn.complete', () => ({ text: '' }) as never)
+
+  await $.classic.PostToolUse({ transcript_path: PATH } as never)
+  await $.turn.complete({ answer: '' } as never)
+
+  // Saved last; the oldest count made room, and what else the store held stays.
+  expect([...held.keys()]).toEqual(['note', ...[2, 3, 4, 5, 6, 7, 8].map(n => `count:/old${n}`), `count:${PATH}`])
+
+  // Another transcript's count (/clear), then this one's again: taken up from where it was saved.
+  await $.classic.PostToolUse({ transcript_path: OTHER } as never)
+  files = { ...files, [PATH]: WHOLE + later }
+  const before = runs.length
+  await $.classic.PostToolUse({ transcript_path: PATH } as never)
+
+  const at = new TextEncoder().encode(WHOLE).length
+  expect(runs.slice(before)).toContainEqual(['tail', '-c', `+${at + 1}`, PATH])
+  expect(runs.slice(before)).not.toContainEqual(['tail', '-c', '+1', PATH])
+
+  const pane = await $.ui.mount({
+    plugin: 'token-panel',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'token-panel',
+    props: { title: 'Token panel', isFocused: false, bodyColumns: 40, placement: 'dock' } as never,
+  })
+
+  // The rows a count from the first byte gives.
+  const rows = count(WHOLE + later, [SUB])
+  expect(rows.map(row => row.uuid)).toEqual(['u1', U2, 'u3'])
+
+  for (const row of rows) {
+    expect((await pane.find({ key: `row:${row.uuid}` }))?.props.label).toContain(row.usd.toFixed(2))
+  }
+
+  expect(await pane.find({ key: 'row:v1' })).toBeUndefined()
+})
+
+test('a saved count made by other rules, or whose file no longer ends a line where it stopped, counts from the first byte', async ($, on) => {
+  const held = new Map<string, unknown>()
+  let files: Record<string, string> = { [PATH]: WHOLE, [OTHER]: '' }
+  const runs = serve(on, () => files)
+
+  store(on, held)
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1_000_000 }, rateLimits: [] } }))
+  on('classic.PostToolUse', () => ({}))
+  on('turn.complete', () => ({ text: '' }) as never)
+
+  await $.classic.PostToolUse({ transcript_path: PATH } as never)
+  await $.turn.complete({ answer: '' } as never)
+  const saved = held.get(`count:${PATH}`) as { rules: string }
+
+  // The rules are the counting code's own text, so an edit to it is told apart.
+  expect(saved.rules).toContain('promptId')
+
+  // Rewritten in place: a byte more ahead of where the count stopped.
+  files = { ...files, [PATH]: ` ${WHOLE}` }
+  await $.classic.PostToolUse({ transcript_path: OTHER } as never)
+  let before = runs.length
+  await $.classic.PostToolUse({ transcript_path: PATH } as never)
+  expect(runs.slice(before)).toContainEqual(['tail', '-c', '+1', PATH])
+
+  // Saved by another release's rules.
+  files = { ...files, [PATH]: WHOLE }
+  held.set(`count:${PATH}`, { ...saved, rules: 'other' })
+  await $.classic.PostToolUse({ transcript_path: OTHER } as never)
+  before = runs.length
+  await $.classic.PostToolUse({ transcript_path: PATH } as never)
+  expect(runs.slice(before)).toEqual([['tail', '-c', '+1', PATH]])
 })

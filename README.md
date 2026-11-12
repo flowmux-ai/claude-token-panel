@@ -22,6 +22,7 @@ The pane starts hidden. The `TokenPanel` button above the prompt or `/token-pane
 - Subagent and advisor calls count toward the prompt that made them, priced at their own model.
 - Internal calls with no transcript row (web search, title generation) add to `cost` only.
 - The `sum` row matches `/cost`. Cost not tied to any prompt shows as `etc unplaced`.
+- Transcripts are read past their last count only, in 4 MiB pieces. Each turn's end saves the count, so a resumed or reloaded session goes on from there; a saved count made by other code, or whose file no longer ends a line where it stopped, is counted again from the start.
 - Transcripts are read with the host's `tail`, each count only what was written since the last. A count that fails says why in the pane's last line.
 
 ## Cost

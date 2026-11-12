@@ -2,8 +2,8 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import type { Flash, Row, Usage } from '../types'
-import type { Cursor } from './tally'
-import { cursor, feed, settle } from './tally'
+import type { Cursor, Saved } from './tally'
+import { cursor, feed, load, save, settle } from './tally'
 
 const PANE = 'token-panel'
 const TITLE = 'Claude Token Panel'
@@ -51,15 +51,74 @@ const locate = async ($: EngineInterface): Promise<string | null> => {
   return (await $.fs.exists(path)) ? path : null
 }
 
-// The session's count so far: the transcript's path, its rows, and how far each file is read. A reload
-// starts over, as the module does; so does a new path (/clear).
-// ponytail: a count from zero reads the whole transcript again, 18 MB in five `tail` runs and ~50 ms of parsing
+// The session's count so far: the transcript's path, its rows, and how far each file is read. A new
+// path (/clear) starts over; a reload or a resume takes up the count saved at the last turn's end.
 type Count = { path: string; rows: Row[]; cursors: Map<string, Cursor> }
 let count: Count | undefined
 
+// Each transcript's count is saved under its path, as a log shipper's registry keeps a file's offset. The
+// store's 4 MiB of JSON serve every session: the newest counts are kept.
+const SAVED = 'count:'
+const CHECKPOINTS = 8
+
+// Counts and saves run one at a time: two at once would read the same bytes twice. Each waits for the
+// one before however it ended, so a failure never stops those after it.
+let queue: Promise<void> = Promise.resolve()
+
+const serially = (work: () => Promise<void>): Promise<void> => {
+  const run = queue.then(work)
+  queue = run.catch(() => undefined)
+
+  return run
+}
+
+// Whether the byte before `at` in `file` ends a line: a file cut short, rewritten or gone does not.
+const endsLine = async ($: EngineInterface, file: string, at: number): Promise<boolean> => {
+  const { exitCode, stdout } = await $.process.run(['sh', '-c', 'tail -c +"$1" "$2" | head -c 1', 'sh', String(at), file])
+
+  return exitCode === 0 && stdout === '\n'
+}
+
+// The count saved for `path`, taken up when these rules made it and every file it read still ends a
+// line where it stopped; any doubt counts from the first byte.
+const restore = async ($: EngineInterface, path: string): Promise<Count> => {
+  const fresh: Count = { path, rows: [], cursors: new Map() }
+
+  try {
+    const saved = (await $.store.get(`${SAVED}${path}`)) as Saved | undefined
+    const loaded = saved === undefined ? undefined : load(saved)
+
+    const isWhole =
+      loaded !== undefined &&
+      (await Promise.all([...loaded.cursors].map(([file, { at }]) => at === 0 || endsLine($, file, at)))).every(Boolean)
+
+    return isWhole ? { path, ...loaded } : fresh
+  } catch {
+    return fresh
+  }
+}
+
+// Saves the count as it stands, the newest last.
+const keep = async ($: EngineInterface): Promise<void> => {
+  if (count === undefined) {
+    return
+  }
+
+  const key = `${SAVED}${count.path}`
+
+  try {
+    await $.store.delete(key)
+    // The store lists keys in the order they were set: the oldest counts go first.
+    const old = (await $.store.keys()).filter(one => one.startsWith(SAVED))
+    await Promise.all(old.slice(0, Math.max(0, old.length - CHECKPOINTS + 1)).map(one => $.store.delete(one)))
+    await $.store.set(key, save(count.rows, count.cursors))
+  } catch {
+    // A checkpoint is only a head start: without one the next count reads from the first byte.
+  }
+}
+
 // Feeds `of.rows` what `path` holds past its cursor, in pieces of what a run's output carries (4 MiB): the
-// engine's own read rejects a file over that, `tail` reads from any offset. Two counts at once feed the
-// same lines, which count once, and set the cursor to the same place.
+// engine's own read rejects a file over that, `tail` reads from any offset. Lines fed twice count once.
 const pull = async ($: EngineInterface, of: Count, path: string, size: number, isMain: boolean): Promise<void> => {
   const place = of.cursors.get(path) ?? cursor()
   of.cursors.set(path, place)
@@ -99,7 +158,7 @@ const pull = async ($: EngineInterface, of: Count, path: string, size: number, i
 // Counts what the session's transcript, and its subagents' beside it, hold since the last count,
 // then sets what the engine billed beyond them against the prompt it fell in.
 // A count that fails leaves the table as it was and says why in the pane.
-const refresh = async ($: EngineInterface, seen?: string, isNewPrompt = false): Promise<void> => {
+const recount = async ($: EngineInterface, seen?: string, isNewPrompt = false): Promise<void> => {
   const path = seen ?? (await read($, usage)).path ?? (await locate($))
 
   if (path === null) {
@@ -107,7 +166,7 @@ const refresh = async ($: EngineInterface, seen?: string, isNewPrompt = false): 
   }
 
   try {
-    const of = count?.path === path ? count : { path, rows: [], cursors: new Map<string, Cursor>() }
+    const of = count?.path === path ? count : await restore($, path)
     count = of
 
     // Before the first prompt the transcript is not written yet: count it empty, but keep its path for the next
@@ -134,6 +193,9 @@ const refresh = async ($: EngineInterface, seen?: string, isNewPrompt = false): 
     await update($, fault, () => `Token panel: ${String(error)}`)
   }
 }
+
+const refresh = ($: EngineInterface, seen?: string, isNewPrompt = false): Promise<void> =>
+  serially(() => recount($, seen, isNewPrompt))
 
 // Opens the pane; one that waits undrawn leaves the button up.
 // ponytail: a waiting pane the terminal later widens to seat keeps the button beside it until pressed
@@ -243,6 +305,7 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     const ended = await next(e)
     await refresh($)
+    await serially(() => keep($))
     // The turn's last response may reach the file a moment after the turn ends.
     $.clock.after(1000, () => void refresh($))
 

@@ -170,6 +170,77 @@ export const feed = (cursor: Cursor, rows: Row[], text: string, isMain: boolean)
   return new TextEncoder().encode(whole).length
 }
 
+// Of a file's counted responses a checkpoint keeps the newest: a response's copies sit together (of
+// 28,908 repeat copies in 490 transcripts none had another response between them), so only the
+// newest can still gain one.
+const KEPT = 4
+
+// The rules a count is made by: a checkpoint made by others (a release, an edit) is not taken up.
+// ponytail: compares the code's own text, a change to a helper outside these functions slips by
+const RULES = [feed, charge, spend].map(String).join('\n') + JSON.stringify(RATES)
+
+/**
+ * A count as `$.store` keeps it, plain data: the rows, and for each file how
+ * far it is read, the prompt its next response falls in, and its newest
+ * responses.
+ */
+export type Saved = {
+  rules: string
+  rows: Row[]
+  files: Record<string, { at: number; row: string | null; newest: [string, string, string, Use][] }>
+}
+
+export const save = (rows: readonly Row[], cursors: ReadonlyMap<string, Cursor>): Saved => ({
+  rules: RULES,
+  rows: rows.map(row => ({ ...row })),
+  files: Object.fromEntries(
+    [...cursors].map(([path, place]) => [
+      path,
+      {
+        at: place.at,
+        row: place.row?.id ?? null,
+        newest: [...place.counted].slice(-KEPT).map(([id, { row, model, usage }]) => [id, row.id, model, usage]),
+      },
+    ]),
+  ),
+})
+
+/**
+ * The count a checkpoint holds, or undefined when other rules made it or a
+ * row it names is missing.
+ */
+export const load = (saved: Saved): { rows: Row[]; cursors: Map<string, Cursor> } | undefined => {
+  if (saved.rules !== RULES) {
+    return undefined
+  }
+
+  const rows = saved.rows.map(row => ({ ...row }))
+  const byId = new Map(rows.map(row => [row.id, row]))
+  const cursors = new Map<string, Cursor>()
+
+  for (const [path, { at, row, newest }] of Object.entries(saved.files)) {
+    const place: Cursor = { at, row: row === null ? undefined : byId.get(row), counted: new Map() }
+
+    for (const [id, owner, model, usage] of newest) {
+      const of = byId.get(owner)
+
+      if (of === undefined) {
+        return undefined
+      }
+
+      place.counted.set(id, { row: of, model, usage })
+    }
+
+    if (row !== null && place.row === undefined) {
+      return undefined
+    }
+
+    cursors.set(path, place)
+  }
+
+  return { rows, cursors }
+}
+
 /**
  * The pane's state after a count: `rows` with each prompt's share of what the
  * engine billed beyond the transcripts. `engine` is the engine's cost total,
